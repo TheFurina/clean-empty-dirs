@@ -167,15 +167,100 @@ class Stats:
         return time.time() - self.start
 
 
+def fmt_duration(seconds: float) -> str:
+    """将秒数格式化为易读的时长字符串"""
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return f"{seconds}秒"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}分{s}秒"
+    h, m = divmod(m, 60)
+    return f"{h}时{m}分{s}秒"
+
+
+class Progress:
+    """进度与预估剩余时间 (ETA) 跟踪器.
+
+    使用 ``\\r`` 在同一行刷新状态; 输出普通日志前应调用 :meth:`interrupt`
+    换行, 避免日志覆盖进度行. 仅在 tty 且非静默时生效.
+    """
+    def __init__(self, enabled=False, quiet=False):
+        self.enabled = enabled and not quiet and sys.stdout.isatty()
+        self.count = 0
+        self.total = 0
+        self.start = time.time()
+        self._last_print = 0.0
+        self._active = False
+
+    def reset(self, total=0):
+        """重置计数与起始时间, 用于切换到下一阶段."""
+        self.count = 0
+        self.total = total
+        self.start = time.time()
+        self._last_print = 0.0
+        self._active = False
+
+    def update(self, n=1):
+        if not self.enabled:
+            return
+        self.count += n
+        now = time.time()
+        if now - self._last_print >= 0.2:
+            self._draw(now)
+            self._last_print = now
+
+    def _draw(self, now=None):
+        if now is None:
+            now = time.time()
+        elapsed = max(now - self.start, 1e-6)
+        rate = self.count / elapsed
+        parts = [f"已处理 {self.count}"]
+        if self.total > 0:
+            pct = min(self.count / self.total * 100, 100.0)
+            eta = (self.total - self.count) / rate if rate > 0 else 0
+            parts.append(f"/{self.total} ({pct:.1f}%)")
+            parts.append(f"速率 {rate:.1f}/s")
+            parts.append(f"剩余约 {fmt_duration(eta)}")
+        else:
+            parts.append(f"速率 {rate:.1f}/s")
+            parts.append("总量未知")
+        line = "  " + "  ".join(parts)
+        sys.stdout.write("\r\033[K" + line)
+        sys.stdout.flush()
+        self._active = True
+
+    def interrupt(self):
+        """输出普通日志前调用, 结束当前进度行并换行."""
+        if self.enabled and self._active:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._active = False
+
+    def done(self):
+        """阶段结束, 刷出最终进度并换行."""
+        if not self.enabled:
+            return
+        self._draw()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._active = False
+
+
 def clean_one_root(root, dry_run, stats, *,
                    skip_hidden=False, exclude_patterns=None,
                    include_patterns=None, min_age_days=0, max_depth=0,
-                   logger=None, quiet=False, record_file=None):
+                   logger=None, quiet=False, record_file=None,
+                   show_eta=False):
     """清理单个根路径下的空文件夹.
 
     两遍策略: 先 topdown 裁剪子树, 再自底向上级联删除.
+    show_eta 为真时在扫描/删除阶段实时刷新进度与预估剩余时间.
     """
+    prog = Progress(enabled=show_eta, quiet=quiet)
+
     def log(msg):
+        prog.interrupt()
         if not quiet:
             print(msg)
         if logger:
@@ -196,8 +281,10 @@ def clean_one_root(root, dry_run, stats, *,
 
     # 第 1 遍: 自顶向下, 裁剪被排除/隐藏/超深的子树
     candidates = []
+    prog.reset(total=0)
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
         stats.scanned += 1
+        prog.update()
         cur_depth = depth_of(dirpath)
 
         kept = []
@@ -216,11 +303,14 @@ def clean_one_root(root, dry_run, stats, *,
 
         if os.path.normpath(dirpath).lower() != root_norm:
             candidates.append(dirpath)
+    prog.done()
 
     # 第 2 遍: 自底向上, 实现级联删除
     candidates.sort(key=lambda p: (p.count(os.sep), len(p)), reverse=True)
 
+    prog.reset(total=len(candidates))
     for full in candidates:
+        prog.update()
         name = os.path.basename(full)
 
         if include_patterns and not matches_patterns(name, include_patterns):
@@ -265,6 +355,7 @@ def clean_one_root(root, dry_run, stats, *,
                     stats.failed += 1
             else:
                 stats.deleted += 1
+    prog.done()
 
 
 def recover_folders(record_path, search_pattern=None, dry_run=False,
@@ -424,6 +515,8 @@ def main():
     parser.add_argument("--search", metavar="PATTERN",
                         help="恢复模式下按名称搜索过滤要恢复的文件夹 (通配符/子串, 大小写不敏感)")
     parser.add_argument("-q", "--quiet", action="store_true", help="静默模式 (不输出到控制台)")
+    parser.add_argument("--eta", action="store_true",
+                        help="显示扫描进度与预估剩余时间 (ETA), 仅在交互终端生效")
     parser.add_argument("--no-color", action="store_true", help="禁用彩色输出")
     args = parser.parse_args()
 
@@ -589,6 +682,13 @@ def main():
                 hid = ""
             args.skip_hidden = hid in ("y", "yes", "是")
 
+        # 进度与 ETA
+        try:
+            eta_in = input("显示扫描进度与预估剩余时间? (y/N): ").strip().lower()
+        except EOFError:
+            eta_in = ""
+        args.eta = eta_in in ("y", "yes", "是")
+
         # 记录被删路径以便恢复
         if not args.dry_run:
             try:
@@ -660,6 +760,7 @@ def main():
             max_depth=args.max_depth,
             logger=logger, quiet=args.quiet,
             record_file=record_file,
+            show_eta=args.eta,
         )
 
     if record_file:
