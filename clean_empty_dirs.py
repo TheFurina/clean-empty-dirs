@@ -180,11 +180,7 @@ def fmt_duration(seconds: float) -> str:
 
 
 class Progress:
-    """进度与预估剩余时间 (ETA) 跟踪器.
-
-    使用 ``\\r`` 在同一行刷新状态; 输出普通日志前应调用 :meth:`interrupt`
-    换行, 避免日志覆盖进度行. 仅在 tty 且非静默时生效.
-    """
+    """进度与 ETA 跟踪器 (仅 tty 且非静默时生效)."""
     def __init__(self, enabled=False, quiet=False):
         self.enabled = enabled and not quiet and sys.stdout.isatty()
         self.count = 0
@@ -255,7 +251,6 @@ def clean_one_root(root, dry_run, stats, *,
     """清理单个根路径下的空文件夹.
 
     两遍策略: 先 topdown 裁剪子树, 再自底向上级联删除.
-    show_eta 为真时在扫描/删除阶段实时刷新进度与预估剩余时间.
     """
     prog = Progress(enabled=show_eta, quiet=quiet)
 
