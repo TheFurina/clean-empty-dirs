@@ -41,6 +41,7 @@
 import argparse
 import fnmatch
 import os
+import re
 import sys
 import time
 
@@ -74,6 +75,14 @@ _COLOR = {
 }
 # 是否启用彩色输出 (运行时按 tty / --no-color 决定)
 USE_COLOR = False
+
+# 匹配 ANSI 颜色转义序列, 用于写入日志文件时剥离
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip_color(s: str) -> str:
+    """从字符串中移除 ANSI 颜色转义码, 供日志文件使用"""
+    return _ANSI_RE.sub("", s)
 
 
 def color(name: str) -> str:
@@ -143,7 +152,9 @@ def list_all_roots():
                 if not d:
                     continue
                 if ctypes.windll.kernel32.GetDriveTypeW(d) == 3:  # DRIVE_FIXED
-                    roots.append(d.rstrip("\\"))
+                    # 保留盘符后的反斜杠 (如 "C:\\"), 否则 "C:" 会被解析为
+                    # C 盘的当前目录而非根目录, 导致 --all 只扫描子树
+                    roots.append(os.path.join(d, ""))
         except Exception as e:
             print(f"[WARN] 枚举磁盘失败, 回退到当前盘符: {e}")
             roots = [os.path.splitdrive(os.getcwd())[0] + os.sep]
@@ -259,7 +270,7 @@ def clean_one_root(root, dry_run, stats, *,
         if not quiet:
             print(msg)
         if logger:
-            logger.write(msg + "\n")
+            logger.write(strip_color(msg) + "\n")
             logger.flush()
 
     if not os.path.isdir(root):
@@ -364,7 +375,7 @@ def recover_folders(record_path, search_pattern=None, dry_run=False,
         if not quiet:
             print(msg)
         if logger:
-            logger.write(msg + "\n")
+            logger.write(strip_color(msg) + "\n")
             logger.flush()
 
     if not os.path.isfile(record_path):
@@ -546,18 +557,24 @@ def main():
         if not args.quiet:
             print(msg)
         if logger:
-            logger.write(msg + "\n")
+            logger.write(strip_color(msg) + "\n")
 
     # 恢复模式: 直接调用后退出
     if args.recover:
-        return recover_folders(
-            args.recover,
-            search_pattern=args.search,
-            dry_run=args.dry_run,
-            yes=args.yes,
-            logger=logger,
-            quiet=args.quiet,
-        )
+        try:
+            return recover_folders(
+                args.recover,
+                search_pattern=args.search,
+                dry_run=args.dry_run,
+                yes=args.yes,
+                logger=logger,
+                quiet=args.quiet,
+            )
+        finally:
+            if logger:
+                logger.close()
+                if not args.quiet:
+                    print(f"日志已保存: {args.log}")
 
     # 无参数时进入交互模式
     if not args.path and not args.all and not args.recover:
@@ -625,14 +642,19 @@ def main():
             search = kw if kw else None
             if logger:
                 logger.close()
-            return recover_folders(
-                rec_file,
-                search_pattern=search,
-                dry_run=dry_run,
-                yes=yes,
-                logger=open(args.log, "w", encoding="utf-8") if args.log else None,
-                quiet=args.quiet,
-            )
+            rec_logger = open(args.log, "w", encoding="utf-8") if args.log else None
+            try:
+                return recover_folders(
+                    rec_file,
+                    search_pattern=search,
+                    dry_run=dry_run,
+                    yes=yes,
+                    logger=rec_logger,
+                    quiet=args.quiet,
+                )
+            finally:
+                if rec_logger:
+                    rec_logger.close()
         else:
             print(f"无效选项: {choice}")
             return 1
@@ -734,6 +756,8 @@ def main():
         banner("\n警告: 即将实际删除空文件夹, 此操作不可逆!")
         if not confirm("确定继续? (y/N): "):
             print("已取消.")
+            if logger:
+                logger.close()
             return 0
 
     # 记录文件句柄 (仅实际删除时打开)
@@ -744,43 +768,48 @@ def main():
         except OSError as e:
             print(f"[WARN] 无法打开记录文件 {args.record}: {e}")
 
-    stats = Stats()
-    for root in roots:
-        clean_one_root(
-            root, args.dry_run, stats,
-            skip_hidden=args.skip_hidden,
-            exclude_patterns=args.exclude,
-            include_patterns=args.include,
-            min_age_days=args.min_age_days,
-            max_depth=args.max_depth,
-            logger=logger, quiet=args.quiet,
-            record_file=record_file,
-            show_eta=args.eta,
-        )
+    try:
+        stats = Stats()
+        for root in roots:
+            clean_one_root(
+                root, args.dry_run, stats,
+                skip_hidden=args.skip_hidden,
+                exclude_patterns=args.exclude,
+                include_patterns=args.include,
+                min_age_days=args.min_age_days,
+                max_depth=args.max_depth,
+                logger=logger, quiet=args.quiet,
+                record_file=record_file,
+                show_eta=args.eta,
+            )
 
-    if record_file:
-        record_file.close()
-        if not args.quiet:
-            print(f"删除记录已保存: {args.record} (可用 --recover {args.record} 恢复)")
+        if record_file:
+            record_file.close()
+            record_file = None
+            if not args.quiet:
+                print(f"删除记录已保存: {args.record} (可用 --recover {args.record} 恢复)")
 
-    banner("\n" + "=" * 60)
-    verb = "将删除" if args.dry_run else "已删除"
-    banner(f"完成. {verb}空文件夹: {color('green')}{stats.deleted}{color('reset')}")
-    banner(f"扫描目录数: {stats.scanned}")
-    if stats.skipped:
-        banner(f"跳过(过滤): {stats.skipped}")
-    if stats.denied:
-        banner(f"权限拒绝: {color('red')}{stats.denied}{color('reset')}")
-    if stats.failed:
-        banner(f"其他失败: {color('red')}{stats.failed}{color('reset')}")
-    banner(f"耗时: {stats.elapsed:.2f} 秒")
-    banner("=" * 60)
-
-    if logger:
-        logger.close()
-        if not args.quiet:
-            print(f"日志已保存: {args.log}")
-    return 0
+        banner("\n" + "=" * 60)
+        verb = "将删除" if args.dry_run else "已删除"
+        banner(f"完成. {verb}空文件夹: {color('green')}{stats.deleted}{color('reset')}")
+        banner(f"扫描目录数: {stats.scanned}")
+        if stats.skipped:
+            banner(f"跳过(过滤): {stats.skipped}")
+        if stats.denied:
+            banner(f"权限拒绝: {color('red')}{stats.denied}{color('reset')}")
+        if stats.failed:
+            banner(f"其他失败: {color('red')}{stats.failed}{color('reset')}")
+        banner(f"耗时: {stats.elapsed:.2f} 秒")
+        banner("=" * 60)
+        return 0
+    finally:
+        # 确保无论正常结束还是异常退出, 文件句柄都被关闭
+        if record_file:
+            record_file.close()
+        if logger:
+            logger.close()
+            if not args.quiet:
+                print(f"日志已保存: {args.log}")
 
 
 if __name__ == "__main__":
