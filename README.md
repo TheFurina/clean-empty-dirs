@@ -134,6 +134,7 @@ $ python clean_empty_dirs.py
 | `-q, --quiet` | 静默模式(不输出到控制台) |
 | `--eta` | 显示扫描进度与预估剩余时间(ETA)，仅在交互终端生效 |
 | `--no-color` | 禁用彩色输出 |
+| `--version` | 显示版本号并退出 |
 
 ## 工作机制
 

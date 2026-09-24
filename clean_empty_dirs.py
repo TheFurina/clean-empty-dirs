@@ -46,6 +46,14 @@ import sys
 import time
 
 
+__version__ = "1.1.0"
+
+
+def eprint(*args, **kwargs):
+    """打印到 stderr, 用于警告/错误信息 (符合 CLI 规范)"""
+    print(*args, file=sys.stderr, **kwargs)
+
+
 # --all 模式排除的系统/关键目录 (路径片段匹配, 大小写不敏感)
 SYSTEM_EXCLUDE_PARTS = {
     # Windows
@@ -156,7 +164,7 @@ def list_all_roots():
                     # C 盘的当前目录而非根目录, 导致 --all 只扫描子树
                     roots.append(os.path.join(d, ""))
         except Exception as e:
-            print(f"[WARN] 枚举磁盘失败, 回退到当前盘符: {e}")
+            eprint(f"[WARN] 枚举磁盘失败, 回退到当前盘符: {e}")
             roots = [os.path.splitdrive(os.getcwd())[0] + os.sep]
         return roots
     else:
@@ -285,10 +293,17 @@ def clean_one_root(root, dry_run, stats, *,
         rel = os.path.relpath(p, root)
         return 0 if rel == "." else rel.count(os.sep) + 1
 
+    def walk_onerror(err):
+        """os.walk 遇到无法访问的目录时调用, 计入 denied 并记录"""
+        path = getattr(err, "filename", "") or str(err)
+        log(f"{color('red')}[DENIED]{color('reset')} {path} ({err})")
+        stats.denied += 1
+
     # 第 1 遍: 自顶向下, 裁剪被排除/隐藏/超深的子树
     candidates = []
     prog.reset(total=0)
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True,
+                                                  onerror=walk_onerror):
         stats.scanned += 1
         prog.update()
         cur_depth = depth_of(dirpath)
@@ -524,6 +539,8 @@ def main():
     parser.add_argument("--eta", action="store_true",
                         help="显示扫描进度与预估剩余时间 (ETA), 仅在交互终端生效")
     parser.add_argument("--no-color", action="store_true", help="禁用彩色输出")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
+                        help="显示版本号并退出")
     args = parser.parse_args()
 
     # 恢复模式与清理模式互斥
@@ -551,7 +568,7 @@ def main():
         try:
             logger = open(args.log, "w", encoding="utf-8")
         except OSError as e:
-            print(f"[WARN] 无法打开日志文件 {args.log}: {e}")
+            eprint(f"[WARN] 无法打开日志文件 {args.log}: {e}")
 
     def banner(msg):
         if not args.quiet:
@@ -766,7 +783,7 @@ def main():
         try:
             record_file = open(args.record, "w", encoding="utf-8")
         except OSError as e:
-            print(f"[WARN] 无法打开记录文件 {args.record}: {e}")
+            eprint(f"[WARN] 无法打开记录文件 {args.record}: {e}")
 
     try:
         stats = Stats()
